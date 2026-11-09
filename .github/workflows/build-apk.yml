@@ -1,0 +1,95 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 取得程式碼
+        uses: actions/checkout@v4
+
+      - name: 安裝 Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 安裝 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: 產生 Android 專案並套用設定
+        run: |
+          mkdir -p /tmp/keep
+          cp -r lib pubspec.yaml /tmp/keep/
+          flutter create --platforms=android --project-name wake_alarm --org com.example .
+          rm -rf test lib
+          cp -r /tmp/keep/lib ./lib
+          cp /tmp/keep/pubspec.yaml ./pubspec.yaml
+          python3 <<'PY'
+          import pathlib
+          import re
+
+          # 1) AndroidManifest：加入權限，並讓鬧鐘畫面可在鎖定畫面顯示
+          m = pathlib.Path("android/app/src/main/AndroidManifest.xml")
+          s = m.read_text(encoding="utf-8")
+          perms = (
+              '    <uses-permission android:name="android.permission.CAMERA" />\n'
+              '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n'
+              '    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />\n'
+              '    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />\n'
+              '    <uses-permission android:name="android.permission.VIBRATE" />\n'
+              '    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />\n'
+          )
+          s = s.replace("<application", perms + "    <application", 1)
+          s = s.replace('android:name=".MainActivity"',
+                        'android:name=".MainActivity" android:showWhenLocked="true" android:turnScreenOn="true"', 1)
+          m.write_text(s, encoding="utf-8")
+
+          # 2) Gradle：minSdk 24，並開啟 core library desugaring（flutter_local_notifications 需要）
+          for path in ["android/app/build.gradle.kts", "android/app/build.gradle"]:
+              g = pathlib.Path(path)
+              if not g.exists():
+                  continue
+              s = g.read_text(encoding="utf-8")
+              if g.suffix == ".kts":
+                  s = re.sub(r"minSdk\s*=\s*flutter\.minSdkVersion", "minSdk = 24", s)
+                  s = re.sub(r"compileOptions\s*\{",
+                             "compileOptions {\n        isCoreLibraryDesugaringEnabled = true", s, count=1)
+                  s += '\ndependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")\n}\n'
+              else:
+                  s = re.sub(r"minSdkVersion\s+flutter\.minSdkVersion", "minSdkVersion 24", s)
+                  s = re.sub(r"compileOptions\s*\{",
+                             "compileOptions {\n        coreLibraryDesugaringEnabled true", s, count=1)
+                  s += "\ndependencies {\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.4'\n}\n"
+              g.write_text(s, encoding="utf-8")
+          PY
+
+      - name: 建置 Release APK
+        run: |
+          flutter pub get
+          flutter build apk --release
+
+      - name: 上傳 APK 到 Actions（備用）
+        uses: actions/upload-artifact@v4
+        with:
+          name: wake-alarm-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+      - name: 發布到 Releases（手機可直接下載）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "build-${{ github.run_number }}" \
+            build/app/outputs/flutter-apk/app-release.apk \
+            --title "醒動鬧鐘 build ${{ github.run_number }}" \
+            --notes "自動建置的 APK"
