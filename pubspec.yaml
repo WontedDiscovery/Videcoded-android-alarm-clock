@@ -1,0 +1,20 @@
+name: wake_alarm
+description: 醒動鬧鐘 - 運動醒腦鬧鐘
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.4.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  camera: ^0.11.0+2
+  google_mlkit_pose_detection: ^1.0.0
+  flutter_local_notifications: ^17.2.0
+  permission_handler: ^11.3.0
+  shared_preferences: ^2.2.0
+  timezone: ^0.9.2
+
+flutter:
+  uses-material-design: true
