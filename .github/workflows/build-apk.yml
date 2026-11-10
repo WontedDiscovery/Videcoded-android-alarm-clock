@@ -39,7 +39,65 @@ jobs:
           import pathlib
           import re
 
-          # 1) AndroidManifest：權限、鎖定畫面顯示、關閉 Impeller（部分機型啟動時會閃退）
+          KOTLIN = '''import android.app.Application
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.os.Build
+          import java.io.PrintWriter
+          import java.io.StringWriter
+
+          class CrashApplication : Application() {
+              override fun onCreate() {
+                  super.onCreate()
+                  val previous = Thread.getDefaultUncaughtExceptionHandler()
+                  Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+                      try {
+                          showCrash(error)
+                      } catch (e: Throwable) {
+                          // 通知失敗就略過，保留原本的崩潰流程
+                      }
+                      previous?.uncaughtException(thread, error)
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              private fun showCrash(error: Throwable) {
+                  val sw = StringWriter()
+                  error.printStackTrace(PrintWriter(sw))
+                  val text = sw.toString().take(3500)
+                  val nm = getSystemService(NotificationManager::class.java)
+                  val builder: Notification.Builder
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      nm.createNotificationChannel(
+                          NotificationChannel("crash", "錯誤記錄", NotificationManager.IMPORTANCE_HIGH)
+                      )
+                      builder = Notification.Builder(this, "crash")
+                  } else {
+                      builder = Notification.Builder(this)
+                  }
+                  val notification = builder
+                      .setSmallIcon(android.R.drawable.stat_notify_error)
+                      .setContentTitle("醒動鬧鐘發生錯誤")
+                      .setContentText(error.toString())
+                      .setStyle(Notification.BigTextStyle().bigText(text))
+                      .setAutoCancel(true)
+                      .build()
+                  nm.notify(9999, notification)
+              }
+          }
+          '''
+
+          # 1) 把錯誤捕捉程式放進 MainActivity 所在的資料夾
+          mains = list(pathlib.Path("android/app/src/main").rglob("MainActivity.kt"))
+          app_class = None
+          if mains:
+              main_kt = mains[0]
+              pkg = re.search(r"^package\s+([\w.]+)", main_kt.read_text(encoding="utf-8"), re.M).group(1)
+              (main_kt.parent / "CrashApplication.kt").write_text("package " + pkg + "\n" + KOTLIN, encoding="utf-8")
+              app_class = ".CrashApplication"
+
+          # 2) AndroidManifest：權限、鎖定畫面顯示、關閉 Impeller、掛上錯誤捕捉
           m = pathlib.Path("android/app/src/main/AndroidManifest.xml")
           s = m.read_text(encoding="utf-8")
           perms = (
@@ -51,13 +109,15 @@ jobs:
               '    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />\n'
           )
           s = s.replace("<application", perms + "    <application", 1)
+          if app_class:
+              s = s.replace('android:name="${applicationName}"', 'android:name="' + app_class + '"', 1)
           s = s.replace('android:name=".MainActivity"',
                         'android:name=".MainActivity" android:showWhenLocked="true" android:turnScreenOn="true"', 1)
           s = s.replace("</application>",
                         '    <meta-data android:name="io.flutter.embedding.android.EnableImpeller" android:value="false" />\n    </application>', 1)
           m.write_text(s, encoding="utf-8")
 
-          # 2) Gradle：minSdk 24，並開啟 core library desugaring（flutter_local_notifications 需要）
+          # 3) Gradle：minSdk 24，並開啟 core library desugaring（flutter_local_notifications 需要）
           for path in ["android/app/build.gradle.kts", "android/app/build.gradle"]:
               g = pathlib.Path(path)
               if not g.exists():
@@ -76,22 +136,32 @@ jobs:
               g.write_text(s, encoding="utf-8")
           PY
 
-      - name: 建置 Release APK
+      - name: 建置醒動鬧鐘 Release APK
         run: |
           flutter pub get
           flutter build apk --release
+          cp build/app/outputs/flutter-apk/app-release.apk wake-alarm.apk
 
-      - name: 上傳 APK 到 Actions（備用）
+      - name: 建置對照用的 Flutter 預設範例 App
+        run: |
+          cd /tmp
+          flutter create --platforms=android --project-name hello_test --org com.example hello_test
+          cd hello_test
+          flutter build apk --release
+          cp build/app/outputs/flutter-apk/app-release.apk "$GITHUB_WORKSPACE/hello-test.apk"
+
+      - name: 上傳 APK（備用）
         uses: actions/upload-artifact@v4
         with:
-          name: wake-alarm-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          name: apks
+          path: |
+            wake-alarm.apk
+            hello-test.apk
 
       - name: 發布到 Releases（手機可直接下載）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "build-${{ github.run_number }}" \
-            build/app/outputs/flutter-apk/app-release.apk \
+          gh release create "build-${{ github.run_number }}" wake-alarm.apk hello-test.apk \
             --title "醒動鬧鐘 build ${{ github.run_number }}" \
-            --notes "自動建置的 APK"
+            --notes "wake-alarm.apk：醒動鬧鐘。hello-test.apk：Flutter 預設範例（對照用）。"
