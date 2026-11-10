@@ -39,33 +39,78 @@ jobs:
           import pathlib
           import re
 
-          KOTLIN = '''import android.app.Application
+          KOTLIN = r'''import android.app.ActivityManager
+          import android.app.Application
+          import android.app.ApplicationExitInfo
           import android.app.Notification
           import android.app.NotificationChannel
           import android.app.NotificationManager
           import android.os.Build
+          import android.widget.Toast
+          import java.io.File
           import java.io.PrintWriter
           import java.io.StringWriter
 
           class CrashApplication : Application() {
+
               override fun onCreate() {
                   super.onCreate()
+                  // Java 層未捕捉的例外：寫入檔案，下次開啟時顯示
                   val previous = Thread.getDefaultUncaughtExceptionHandler()
                   Thread.setDefaultUncaughtExceptionHandler { thread, error ->
                       try {
-                          showCrash(error)
+                          val sw = StringWriter()
+                          error.printStackTrace(PrintWriter(sw))
+                          File(filesDir, "crash_java.txt").writeText(sw.toString().take(20000))
                       } catch (e: Throwable) {
-                          // 通知失敗就略過，保留原本的崩潰流程
+                          // 寫入失敗就略過
                       }
                       previous?.uncaughtException(thread, error)
                   }
+                  // 顯示上次的崩潰原因（含 C/C++ 層的崩潰）
+                  try {
+                      reportPreviousCrash()
+                  } catch (e: Throwable) {
+                      // 略過
+                  }
               }
 
+              private fun reportPreviousCrash() {
+                  val javaFile = File(filesDir, "crash_java.txt")
+                  if (javaFile.exists()) {
+                      val text = javaFile.readText()
+                      javaFile.delete()
+                      showNotice(9001, "醒動鬧鐘上次的程式錯誤", text.take(3500))
+                  }
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                      val prefs = getSharedPreferences("crash", MODE_PRIVATE)
+                      val seen = prefs.getLong("ts", 0L)
+                      val am = getSystemService(ActivityManager::class.java)
+                      val infos = am.getHistoricalProcessExitReasons(packageName, 0, 8)
+                      val info = infos.firstOrNull { it.timestamp > seen && isCrash(it.reason) } ?: return
+                      prefs.edit().putLong("ts", info.timestamp).apply()
+                      val trace = info.traceInputStream?.bufferedReader()?.use { it.readText() } ?: ""
+                      val reason = when (info.reason) {
+                          ApplicationExitInfo.REASON_CRASH_NATIVE -> "原生層崩潰"
+                          ApplicationExitInfo.REASON_SIGNALED -> "程序被系統終止（訊號）"
+                          ApplicationExitInfo.REASON_CRASH -> "Java 層例外"
+                          ApplicationExitInfo.REASON_ANR -> "無回應（ANR）"
+                          else -> "原因代碼 ${info.reason}"
+                      }
+                      val body = (info.description ?: "") + "\n" + trace
+                      showNotice(9002, "醒動鬧鐘閃退：$reason", body.take(3500))
+                  }
+              }
+
+              private fun isCrash(reason: Int): Boolean =
+                  reason == ApplicationExitInfo.REASON_CRASH ||
+                      reason == ApplicationExitInfo.REASON_CRASH_NATIVE ||
+                      reason == ApplicationExitInfo.REASON_SIGNALED ||
+                      reason == ApplicationExitInfo.REASON_ANR ||
+                      reason == ApplicationExitInfo.REASON_INITIALIZATION_FAILURE
+
               @Suppress("DEPRECATION")
-              private fun showCrash(error: Throwable) {
-                  val sw = StringWriter()
-                  error.printStackTrace(PrintWriter(sw))
-                  val text = sw.toString().take(3500)
+              private fun showNotice(id: Int, title: String, body: String) {
                   val nm = getSystemService(NotificationManager::class.java)
                   val builder: Notification.Builder
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -78,17 +123,18 @@ jobs:
                   }
                   val notification = builder
                       .setSmallIcon(android.R.drawable.stat_notify_error)
-                      .setContentTitle("醒動鬧鐘發生錯誤")
-                      .setContentText(error.toString())
-                      .setStyle(Notification.BigTextStyle().bigText(text))
+                      .setContentTitle(title)
+                      .setContentText(body.take(80))
+                      .setStyle(Notification.BigTextStyle().bigText(body))
                       .setAutoCancel(true)
                       .build()
-                  nm.notify(9999, notification)
+                  nm.notify(id, notification)
+                  Toast.makeText(this, title, Toast.LENGTH_LONG).show()
               }
           }
           '''
 
-          # 1) 把錯誤捕捉程式放進 MainActivity 所在的資料夾
+          # 1) 把 CrashApplication 放進 MainActivity 所在的套件
           mains = list(pathlib.Path("android/app/src/main").rglob("MainActivity.kt"))
           app_class = None
           if mains:
@@ -97,9 +143,15 @@ jobs:
               (main_kt.parent / "CrashApplication.kt").write_text("package " + pkg + "\n" + KOTLIN, encoding="utf-8")
               app_class = ".CrashApplication"
 
-          # 2) AndroidManifest：權限、鎖定畫面顯示、關閉 Impeller、掛上錯誤捕捉
+          # 2) AndroidManifest：掛上錯誤捕捉、App 名稱、權限、鎖定畫面顯示、關閉 Impeller
           m = pathlib.Path("android/app/src/main/AndroidManifest.xml")
           s = m.read_text(encoding="utf-8")
+          if app_class:
+              if "${applicationName}" in s:
+                  s = s.replace('android:name="${applicationName}"', 'android:name="' + app_class + '"', 1)
+              else:
+                  s = s.replace("<application", '<application android:name="' + app_class + '"', 1)
+          s = s.replace('android:label="wake_alarm"', 'android:label="醒動鬧鐘"', 1)
           perms = (
               '    <uses-permission android:name="android.permission.CAMERA" />\n'
               '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n'
@@ -109,13 +161,12 @@ jobs:
               '    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />\n'
           )
           s = s.replace("<application", perms + "    <application", 1)
-          if app_class:
-              s = s.replace('android:name="${applicationName}"', 'android:name="' + app_class + '"', 1)
           s = s.replace('android:name=".MainActivity"',
                         'android:name=".MainActivity" android:showWhenLocked="true" android:turnScreenOn="true"', 1)
           s = s.replace("</application>",
                         '    <meta-data android:name="io.flutter.embedding.android.EnableImpeller" android:value="false" />\n    </application>', 1)
           m.write_text(s, encoding="utf-8")
+          print("CrashApplication 已掛上：", bool(app_class) and (app_class in s))
 
           # 3) Gradle：minSdk 24，並開啟 core library desugaring（flutter_local_notifications 需要）
           for path in ["android/app/build.gradle.kts", "android/app/build.gradle"]:
@@ -142,26 +193,16 @@ jobs:
           flutter build apk --release
           cp build/app/outputs/flutter-apk/app-release.apk wake-alarm.apk
 
-      - name: 建置對照用的 Flutter 預設範例 App
-        run: |
-          cd /tmp
-          flutter create --platforms=android --project-name hello_test --org com.example hello_test
-          cd hello_test
-          flutter build apk --release
-          cp build/app/outputs/flutter-apk/app-release.apk "$GITHUB_WORKSPACE/hello-test.apk"
-
       - name: 上傳 APK（備用）
         uses: actions/upload-artifact@v4
         with:
-          name: apks
-          path: |
-            wake-alarm.apk
-            hello-test.apk
+          name: wake-alarm-apk
+          path: wake-alarm.apk
 
       - name: 發布到 Releases（手機可直接下載）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "build-${{ github.run_number }}" wake-alarm.apk hello-test.apk \
+          gh release create "build-${{ github.run_number }}" wake-alarm.apk \
             --title "醒動鬧鐘 build ${{ github.run_number }}" \
-            --notes "wake-alarm.apk：醒動鬧鐘。hello-test.apk：Flutter 預設範例（對照用）。"
+            --notes "wake-alarm.apk：醒動鬧鐘（閃退時會顯示錯誤原因）"
