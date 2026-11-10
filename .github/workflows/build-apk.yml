@@ -39,7 +39,7 @@ jobs:
           import pathlib
           import re
 
-          # 1) AndroidManifest：加入權限，並讓鬧鐘畫面可在鎖定畫面顯示
+          # 1) AndroidManifest：權限、鎖定畫面顯示、關閉 Impeller（部分機型啟動時會閃退）
           m = pathlib.Path("android/app/src/main/AndroidManifest.xml")
           s = m.read_text(encoding="utf-8")
           perms = (
@@ -53,6 +53,8 @@ jobs:
           s = s.replace("<application", perms + "    <application", 1)
           s = s.replace('android:name=".MainActivity"',
                         'android:name=".MainActivity" android:showWhenLocked="true" android:turnScreenOn="true"', 1)
+          s = s.replace("</application>",
+                        '    <meta-data android:name="io.flutter.embedding.android.EnableImpeller" android:value="false" />\n    </application>', 1)
           m.write_text(s, encoding="utf-8")
 
           # 2) Gradle：minSdk 24，並開啟 core library desugaring（flutter_local_notifications 需要）
